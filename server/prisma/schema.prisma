@@ -1,0 +1,465 @@
+// Prisma Schema for DeutschLab (German Learning Platform A0 to B2)
+// Strict SQLite schema supporting offline-first, FSRS, AI resiliency, and Zero-Trust architecture.
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ----------------------------------------------------
+// 1. User, Authentication & Security
+// ----------------------------------------------------
+
+model User {
+  id                String             @id @default(uuid())
+  email             String             @unique
+  username          String             @unique
+  passwordHash      String
+  role              String             @default("USER") // ADMIN, USER, LEARNER
+  cefrLevel         String             @default("A0")   // A0, A1, A2, B1, B2
+  streakDays        Int                @default(0)
+  lastStudyDate     DateTime?
+  totalXp           Int                @default(0)
+  settings          String?            // JSON string: { defaultReadingMode, speechRate, autoPlayAudio, theme }
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  sessions          Session[]
+  fsrsProgress      FsrsProgress[]
+  stories           Story[]
+  shadowingSessions ShadowingSession[]
+  examSessions      ExamSession[]
+  auditLogs         AuditLog[]
+
+  @@map("users")
+}
+
+model Session {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String   @unique
+  ipAddress  String?
+  userAgent  String?
+  deviceType String?  // DESKTOP, MOBILE, TABLET
+  isValid    Boolean  @default(true)
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("sessions")
+}
+
+// Phone-as-a-Scanner OTT Pairing
+model DevicePairing {
+  id              String   @id @default(uuid())
+  token           String   @unique // Short-lived OTT (One-Time Token)
+  qrPayload       String   // Encrypted connection configuration
+  pcSocketId      String?
+  mobileSocketId  String?
+  status          String   @default("PENDING") // PENDING, PAIRED, EXPIRED, DISCONNECTED
+  ipAddress       String?
+  userAgent       String?
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([token])
+  @@map("device_pairings")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String   // LOGIN, FAILED_LOGIN, KEY_ROTATED, PROVIDER_ADDED, SSRF_BLOCKED, FILE_REJECTED
+  ipAddress String?
+  userAgent String?
+  severity  String   @default("INFO") // INFO, WARN, SECURITY, CRITICAL
+  details   String?  // JSON string
+  createdAt DateTime @default(now())
+
+  @@index([severity, createdAt])
+  @@map("audit_logs")
+}
+
+model DatabaseBackup {
+  id             String   @id @default(uuid())
+  filename       String
+  filePath       String
+  sizeBytes      Int
+  checksumSha256 String
+  triggerType    String   @default("MANUAL") // MANUAL, SCHEDULED
+  status         String   @default("SUCCESS") // SUCCESS, FAILED
+  error          String?
+  createdAt      DateTime @default(now())
+
+  @@map("database_backups")
+}
+
+// ----------------------------------------------------
+// 2. AI Provider Management & Resilience Engine
+// ----------------------------------------------------
+
+model AiProvider {
+  id               String        @id @default(uuid())
+  name             String        // e.g. "Google Gemini", "OpenAI", "Anthropic", "OpenRouter", "Custom vLLM"
+  providerType     String        // GEMINI, OPENAI, ANTHROPIC, OPENROUTER, CUSTOM
+  encryptedApiKey  String?       // AES-256-GCM cipher text
+  apiKeyIv         String?       // Initialization Vector for AES-256-GCM
+  apiKeyTag        String?       // Authentication Tag for AES-256-GCM
+  baseUrl          String?       // Base URL for API calls
+  customEndpoint   String?       // Custom endpoint path
+  customHeaders    String?       // JSON string of custom HTTP headers
+  modelName        String        // Selected or overridden model name
+  isActive         Boolean       @default(true)
+  isDefault        Boolean       @default(false)
+  latencyMs        Int?          // Latency from last health check
+  lastTestedAt     DateTime?
+  testStatus       String        @default("UNTESTED") // UNTESTED, SUCCESS, FAILED
+  testError        String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  tasks            TaskQueue[]
+  usageLogs        AiUsageLog[]
+
+  @@map("ai_providers")
+}
+
+model TaskQueue {
+  id              String            @id @default(uuid())
+  idempotencyKey  String?           @unique
+  taskType        String            // OCR_SCAN, BATCH_PDF, VOCAB_GEN, SENTENCE_GEN, GRAMMAR_ANALYSIS, STORY_GEN, EXAM_EVAL
+  priority        Int               @default(10) // 1 = Urgent, 5 = High, 10 = Normal, 20 = Low
+  status          String            @default("PENDING") // PENDING, RUNNING, COMPLETED, FAILED, PAUSED, CANCELLED
+  providerId      String?
+  provider        AiProvider?       @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  payload         String            // JSON serialized input payload
+  partialResult   String?           // JSON serialized partial progress result
+  finalResult     String?           // JSON serialized final completed output
+  progressPercent Float             @default(0.0)
+  currentStep     Int               @default(0)
+  totalSteps      Int               @default(1)
+  attemptCount    Int               @default(0)
+  maxAttempts     Int               @default(5)
+  lastError       String?
+  errorCategory   String?           // RATE_LIMIT, TIMEOUT, NETWORK, SERVER_ERROR, AUTH_ERROR, INVALID_INPUT
+  retryAfter      DateTime?
+  scheduledAt     DateTime          @default(now())
+  startedAt       DateTime?
+  finishedAt      DateTime?
+  parentTaskId    String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  checkpoints     TaskCheckpoint[]
+  usageLogs       AiUsageLog[]
+
+  @@index([status, priority, scheduledAt])
+  @@index([idempotencyKey])
+  @@map("task_queue")
+}
+
+model TaskCheckpoint {
+  id            String    @id @default(uuid())
+  taskId        String
+  task          TaskQueue @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  checkpointType String   // PAGE_COMPLETED, BATCH_COMPLETED, ITEM_COMPLETED
+  pageNumber    Int?      // E.g., page 180 out of 300
+  itemIndex     Int?
+  totalItems    Int?
+  stateSnapshot String    // JSON serialized state for seamless resumption
+  metadata      String?   // JSON serialized auxiliary metadata
+  createdAt     DateTime  @default(now())
+
+  @@index([taskId, pageNumber])
+  @@map("task_checkpoints")
+}
+
+model AiUsageLog {
+  id               String      @id @default(uuid())
+  providerId       String?
+  provider         AiProvider? @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  taskId           String?
+  task             TaskQueue?  @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  modelName        String
+  taskType         String
+  inputTokens      Int         @default(0)
+  outputTokens     Int         @default(0)
+  totalTokens      Int         @default(0)
+  estimatedCostUsd Float       @default(0.0)
+  latencyMs        Int         @default(0)
+  isSuccess        Boolean     @default(true)
+  errorCode        String?
+  errorMessage     String?
+  createdAt        DateTime    @default(now())
+
+  @@index([providerId, createdAt])
+  @@index([taskType, createdAt])
+  @@map("ai_usage_logs")
+}
+
+// ----------------------------------------------------
+// 3. Vision, Textbooks & Staging Workflow
+// ----------------------------------------------------
+
+model Source {
+  id                String               @id @default(uuid())
+  title             String
+  author            String?
+  sourceType        String               // TEXTBOOK_PDF, IMAGE_SCAN, AI_GENERATED, MANUAL
+  originalFilename  String?
+  sanitizedFilePath String?              // Cleaned, metadata-stripped file path
+  pageCount         Int                  @default(1)
+  checksumSha256    String?
+  fileSizeBytes     Int?
+  mimeType          String?
+  metadata          String?              // JSON string
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  stagingItems      StagingPreviewItem[]
+  vocabularies      Vocabulary[]
+
+  @@map("sources")
+}
+
+model StagingPreviewItem {
+  id            String   @id @default(uuid())
+  sourceId      String
+  source        Source   @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  pageNumber    Int      @default(1)
+  itemType      String   // VOCAB, GRAMMAR, SENTENCE
+  extractedData String   // JSON string of raw AI extraction
+  editedData    String?  // JSON string of user edits before approval
+  status        String   @default("PENDING") // PENDING, APPROVED, REJECTED, EDITED, REPROCESSED
+  reviewerNotes String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([sourceId, pageNumber])
+  @@index([status])
+  @@map("staging_preview_items")
+}
+
+// ----------------------------------------------------
+// 4. Vocabulary Factory, Lemmas & 5-Sentence System
+// ----------------------------------------------------
+
+model Lemma {
+  id           String       @id @default(uuid())
+  lemma        String       @unique // Base canonical form e.g. "gehen", "Haus"
+  partOfSpeech String       // NOUN, VERB, ADJECTIVE, ADVERB, PREPOSITION, CONJUNCTION, PRONOUN, PHRASE
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  vocabularies Vocabulary[]
+
+  @@map("lemmas")
+}
+
+model Vocabulary {
+  id                 String            @id @default(uuid())
+  lemmaId            String?
+  lemmaRef           Lemma?            @relation(fields: [lemmaId], references: [id], onDelete: SetNull)
+  lemma              String            // Normalized base word
+  word               String            // Concrete representation
+  article            String?           // DER, DIE, DAS, NONE
+  plural             String?           // Plural with article, e.g. "die Häuser"
+  partOfSpeech       String            // NOUN, VERB, ADJECTIVE, etc.
+  cefrLevel          String            @default("A1") // A0, A1, A2, B1, B2
+  arabicTranslation  String
+  englishTranslation String?
+  ipaPhonetics       String?           // International Phonetic Alphabet (e.g. /haʊ̯s/)
+  audioUrl           String?
+  colorCode          String?           // DER: #3b82f6, DIE: #ef4444, DAS: #22c55e
+  verbConjugations   String?           // JSON: { present: {...}, prateritum: {...}, perfekt: "...", auxiliary: "haben"|"sein" }
+  governingCases     String?           // JSON: ["AKKUSATIV", "DATIV"] or "warten auf + Akk"
+  notes              String?
+  status             String            @default("NEW") // NEW, LEARNING, MASTERED, NEEDS_REVIEW
+  sourceId           String?
+  source             Source?           @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  sentenceHistories  SentenceHistory[]
+  fsrsProgress       FsrsProgress[]
+
+  @@index([lemma])
+  @@index([cefrLevel])
+  @@index([status])
+  @@map("vocabularies")
+}
+
+model SentenceHistory {
+  id                   String     @id @default(uuid())
+  vocabularyId         String
+  vocabulary           Vocabulary @relation(fields: [vocabularyId], references: [id], onDelete: Cascade)
+  sentenceNumber       Int        // 1 through 5 in the 5-Sentence rule
+  sentenceDe           String
+  sentenceAr           String
+  grammaticalBreakdown String     // JSON string: syntax breakdown, cases, word annotations
+  verbAssociation      String?    // Role of verb or case trigger in sentence
+  cefrLevel            String     @default("A1")
+  audioUrl             String?
+  isCurrentActive      Boolean    @default(true) // Supports non-destructive regeneration
+  generationBatchId    String?    // Batch ID for tracking 5-sentence generation runs
+  versionNumber        Int        @default(1)
+  createdAt            DateTime   @default(now())
+
+  @@index([vocabularyId, isCurrentActive])
+  @@map("sentence_histories")
+}
+
+// ----------------------------------------------------
+// 5. Brutal Grammar Engine & Drills
+// ----------------------------------------------------
+
+model GrammarRule {
+  id                        String         @id @default(uuid())
+  title                     String
+  slug                      String         @unique
+  cefrLevel                 String         // A0, A1, A2, B1, B2
+  category                  String         // VERB_TENSES, CASES, WORD_ORDER, PASSIV, RELATIVSATZ, etc.
+  formulaSyntax             String         // Interactive syntax formula e.g. "[Subjekt] + [Modalverb] + ... + [Infinitiv]"
+  explanationMarkdown       String         // Full German/English explanation
+  arabicExplanationMarkdown String         // In-depth Arabic explanation
+  examples                  String         // JSON array of annotated examples
+  visualDiagram             String?        // JSON string of syntax diagram / flowchart
+  createdAt                 DateTime       @default(now())
+  updatedAt                 DateTime       @updatedAt
+
+  drills                    GrammarDrill[]
+  fsrsProgress              FsrsProgress[]
+
+  @@index([cefrLevel, category])
+  @@map("grammar_rules")
+}
+
+model GrammarDrill {
+  id            String      @id @default(uuid())
+  grammarRuleId String
+  grammarRule   GrammarRule @relation(fields: [grammarRuleId], references: [id], onDelete: Cascade)
+  cefrLevel     String
+  drillType     String      // FILL_IN_BLANK, REORDER_WORDS, MULTIPLE_CHOICE, CASE_SELECTION
+  questionDe    String
+  promptAr      String
+  options       String?     // JSON array of options
+  correctAnswer String
+  explanationAr String
+  difficulty    Int         @default(1)
+  createdAt     DateTime    @default(now())
+
+  @@index([grammarRuleId])
+  @@map("grammar_drills")
+}
+
+// ----------------------------------------------------
+// 6. FSRS Spaced Repetition Engine
+// ----------------------------------------------------
+
+model FsrsProgress {
+  id            String       @id @default(uuid())
+  userId        String
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  itemType      String       // VOCABULARY, GRAMMAR_RULE
+  vocabularyId  String?
+  vocabulary    Vocabulary?  @relation(fields: [vocabularyId], references: [id], onDelete: Cascade)
+  grammarRuleId String?
+  grammarRule   GrammarRule? @relation(fields: [grammarRuleId], references: [id], onDelete: Cascade)
+  state         String       @default("NEW") // NEW (0), LEARNING (1), REVIEW (2), RELEARNING (3)
+  stability     Float        @default(0.0)
+  difficulty    Float        @default(0.0)
+  elapsedDays   Int          @default(0)
+  scheduledDays Int          @default(0)
+  reps          Int          @default(0)
+  lapses        Int          @default(0)
+  lastReview    DateTime?
+  nextReview    DateTime     @default(now())
+  history       String?      // JSON array of rating reviews: [{ rating, reviewDate, scheduledDays }]
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([userId, nextReview])
+  @@index([userId, itemType, state])
+  @@map("fsrs_progress")
+}
+
+// ----------------------------------------------------
+// 7. Milestone Stories, Speech Shadowing & Exams
+// ----------------------------------------------------
+
+model Story {
+  id                      String    @id @default(uuid())
+  userId                  String
+  user                    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  titleDe                 String
+  titleAr                 String
+  cefrLevel               String    // A1, A2, B1, B2
+  storyTextDe             String
+  storyTextAr             String
+  readingModeDefault      String    @default("DUAL") // DUAL (Ar+De), TOGGLE (Click to reveal), GERMAN_ONLY
+  vocabularyUsed          String    // JSON array of word strings or vocabulary IDs
+  unknownWords            String?   // JSON array of newly encountered words with inline glossary
+  audioUrl                String?
+  comprehensionQuestions  String    // JSON array: [{ questionDe, questionAr, options, correctAnswer }]
+  userScore               Float?
+  completedAt             DateTime?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  @@index([userId, cefrLevel])
+  @@map("stories")
+}
+
+model ShadowingSession {
+  id                String   @id @default(uuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sentenceDe        String
+  speed             Float    @default(1.0) // 0.75x to 1.0x
+  targetAudioUrl    String?
+  recordedAudioPath String?
+  recognizedTextDe  String?
+  accuracyScore     Float    @default(0.0) // 0 to 100%
+  phonemeBreakdown  String?  // JSON string of word/syllable matching & error classification
+  feedback          String?  // JSON string of pronunciation improvement tips
+  createdAt         DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("shadowing_sessions")
+}
+
+model ExamSession {
+  id                     String    @id @default(uuid())
+  userId                 String
+  user                   User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  examType               String    // GOETHE, TELC
+  cefrLevel              String    // A1, A2, B1, B2
+  status                 String    @default("IN_PROGRESS") // IN_PROGRESS, SUBMITTED, EVALUATED, CANCELLED
+  readingScore           Float?
+  listeningScore         Float?
+  writingScore           Float?
+  speakingScore          Float?
+  totalScore             Float?
+  isPassed               Boolean?
+  examData               String    // JSON string: sections, timed modules, audio prompts, questions
+  userAnswers            String?   // JSON string: user's submitted responses
+  detailedRubric         String?   // JSON string: section-by-section standardized rubric scores
+  aiWeaknessAnalysis     String?   // JSON string: deep diagnostic report of linguistic weak points
+  disclaimerAcknowledged Boolean   @default(true) // AI score disclaimer (estimates only)
+  timeSpentSeconds       Int       @default(0)
+  startedAt              DateTime  @default(now())
+  completedAt            DateTime?
+  createdAt              DateTime  @default(now())
+
+  @@index([userId, examType, cefrLevel])
+  @@map("exam_sessions")
+}
